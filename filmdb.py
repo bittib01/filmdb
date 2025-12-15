@@ -20,14 +20,13 @@ START_YEAR, END_YEAR = 2018, 2025
 ACTOR_LIMIT = 5
 REQUEST_TIMEOUT = 25
 LOG_EVERY = 50
-PAGE_LIMIT_PER_YEAR: Optional[int] = None  # 全量跑保持 None
+PAGE_LIMIT_PER_YEAR: Optional[int] = None
 
-# 按季度分片；如需更细可改为月度
 RANGES = [("01-01", "03-31"), ("04-01", "06-30"), ("07-01", "09-30"), ("10-01", "12-31")]
 
 SESSION = requests.Session()
 MAX_RETRIES = 3
-BACKOFF_BASE = 1.5  # 指数退避系数
+BACKOFF_BASE = 1.5
 
 
 def fatal(msg):
@@ -152,14 +151,6 @@ def derive_country(detail: dict, countries: Set[str]) -> str:
         code = (pcs[0].get("iso_3166_1") or "").lower()
         if code and code in countries:
             return code
-    spoken = detail.get("spoken_languages") or []
-    if spoken:
-        lang_code = (spoken[0].get("iso_639_1") or "").lower()
-        if lang_code and lang_code in countries:
-            return lang_code
-    ol = (detail.get("original_language") or "").lower()
-    if ol and ol in countries:
-        return ol
     return ""
 
 
@@ -280,10 +271,8 @@ def main():
                                 "sort_by": "popularity.desc",
                                 "language": "en-US",
                                 "with_release_type": "3",
-                                # 可选收敛：
-                                # "region": "US",
-                                # "vote_count.gte": 50,
-                                # "with_runtime.gte": 60,
+                                "vote_count.gte": 5,
+                                "with_runtime.gte": 60,
                             }
                             data = tmdb_get("https://api.themoviedb.org/3/discover/movie", params=params)
                             total_pages = min(data.get("total_pages", 1), 500)
