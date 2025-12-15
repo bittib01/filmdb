@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import logging
 from typing import Dict, Tuple, List, Set, Optional
 import requests
@@ -17,14 +18,16 @@ DB_DSN = os.getenv("DB_DSN")
 
 START_YEAR, END_YEAR = 2018, 2025
 ACTOR_LIMIT = 5
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 25
 LOG_EVERY = 50
-PAGE_LIMIT_PER_YEAR: Optional[int] = None
+PAGE_LIMIT_PER_YEAR: Optional[int] = None  # 全量跑保持 None
 
 # 按季度分片；如需更细可改为月度
 RANGES = [("01-01", "03-31"), ("04-01", "06-30"), ("07-01", "09-30"), ("10-01", "12-31")]
 
 SESSION = requests.Session()
+MAX_RETRIES = 3
+BACKOFF_BASE = 1.5  # 指数退避系数
 
 
 def fatal(msg):
@@ -37,6 +40,31 @@ def trim(s: str, limit: int) -> str:
         return ""
     s = s.strip()
     return s[:limit]
+
+
+def tmdb_get(url, params=None):
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                sleep_s = float(retry_after) if retry_after else BACKOFF_BASE ** attempt
+                time.sleep(sleep_s)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            time.sleep(BACKOFF_BASE ** attempt)
+            continue
+        except requests.HTTPError as e:
+            if 500 <= resp.status_code < 600:
+                last_exc = e
+                time.sleep(BACKOFF_BASE ** attempt)
+                continue
+            raise
+    raise last_exc or Exception("TMDb request failed after retries")
 
 
 def ensure_sequences(conn):
@@ -77,43 +105,10 @@ def fetch_existing(conn):
     return movies_key, people_key, countries
 
 
-def tmdb_get(url, params=None):
-    resp = SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def tmdb_discover(year: int):
-    for start, end in RANGES:
-        page, total_pages = 1, 1
-        while page <= total_pages:
-            if PAGE_LIMIT_PER_YEAR is not None and page > PAGE_LIMIT_PER_YEAR:
-                break
-            params = {
-                "primary_release_date.gte": f"{year}-{start}",
-                "primary_release_date.lte": f"{year}-{end}",
-                "include_adult": False,
-                "include_video": False,
-                "page": page,
-                "sort_by": "popularity.desc",
-                "language": "en-US",
-                "with_release_type": "3",  # 院线正式
-                "vote_count.gte": 2,
-                "with_runtime.gte": 60,
-            }
-            data = tmdb_get("https://api.themoviedb.org/3/discover/movie", params=params)
-            total_pages = min(data.get("total_pages", 1), 500)  # TMDb 可访问上限 500
-            yield data, page, total_pages, start, end
-            page += 1
-
-
 def tmdb_movie_detail_with_append(movie_id: int):
     return tmdb_get(
         f"https://api.themoviedb.org/3/movie/{movie_id}",
-        params={
-            "language": "en-US",
-            "append_to_response": "credits,alternative_titles",
-        },
+        params={"language": "en-US", "append_to_response": "credits,alternative_titles"},
     )
 
 
@@ -152,12 +147,19 @@ def year_or_none(date_str: str):
 
 
 def derive_country(detail: dict, countries: Set[str]) -> str:
-    # 1) production_countries[0].iso_3166_1
     pcs = detail.get("production_countries") or []
     if pcs:
         code = (pcs[0].get("iso_3166_1") or "").lower()
         if code and code in countries:
             return code
+    spoken = detail.get("spoken_languages") or []
+    if spoken:
+        lang_code = (spoken[0].get("iso_639_1") or "").lower()
+        if lang_code and lang_code in countries:
+            return lang_code
+    ol = (detail.get("original_language") or "").lower()
+    if ol and ol in countries:
+        return ol
     return ""
 
 
@@ -169,7 +171,7 @@ def insert_movie(cur, movie):
         RETURNING movieid;
         """,
         (
-            trim(movie["title"], 100),  # 片名截断到 100
+            trim(movie["title"], 100),
             movie["country"],
             movie["year_released"],
             movie["runtime"],
@@ -188,8 +190,8 @@ def upsert_people(cur, person):
         RETURNING peopleid;
         """,
         (
-            trim(person["first_name"], 30),  # 名截断到 30
-            trim(person["surname"], 30),     # 姓截断到 30
+            trim(person["first_name"], 30),
+            trim(person["surname"], 30),
             person["born"],
             person["died"],
             person["gender"],
@@ -207,7 +209,7 @@ def upsert_people(cur, person):
 
 
 def upsert_alt_titles(cur, movieid: int, titles: List[str]):
-    dedup = {trim(t, 250) for t in titles if t}  # 别名截断到 250
+    dedup = {trim(t, 250) for t in titles if t}
     if not dedup:
         return
     execute_values(
@@ -253,167 +255,221 @@ def main():
     new_movies = new_people = new_credits = 0
     skip_country_counter: Dict[str, int] = {}
     person_cache: Dict[int, dict] = {}
+    quarter_summaries: List[dict] = []
 
     try:
         with conn.cursor() as cur:
             for year in range(START_YEAR, END_YEAR + 1):
-                seen = inserted = skipped_country = skipped_year = 0
                 logging.info("处理年份 %s", year)
-                for data, page_no, total_pages, start, end in tmdb_discover(year):
-                    results = data.get("results", [])
-                    if page_no == 1:
-                        logging.info("年份 %s 分片 %s-%s 总页数 ≈ %d", year, start, end, total_pages)
-                    for item in results:
-                        tmdb_id = item["id"]
-                        seen += 1
-                        if seen % LOG_EVERY == 0:
-                            logging.info(
-                                "年份 %s 分片 %s-%s 进度：页 %d/%d，已处理 %d 条（插入 %d，跳过国家 %d）",
-                                year, start, end, page_no, total_pages, seen, inserted, skipped_country
-                            )
+                for start, end in RANGES:
+                    seen = inserted = skipped_country = skipped_year = 0
+                    credit_rows_buffer: List[Tuple[int, int, str]] = []  # unused but kept for clarity
+                    logging.info("年份 %s 分片 %s-%s 开始", year, start, end)
 
-                        detail = tmdb_movie_detail_with_append(tmdb_id)
-                        release_year = year_or_none(detail.get("release_date"))
-                        if not release_year or release_year < START_YEAR or release_year > END_YEAR:
-                            skipped_year += 1
-                            continue
+                    page, total_pages = 1, 1
+                    try:
+                        while page <= total_pages:
+                            if PAGE_LIMIT_PER_YEAR is not None and page > PAGE_LIMIT_PER_YEAR:
+                                break
+                            params = {
+                                "primary_release_date.gte": f"{year}-{start}",
+                                "primary_release_date.lte": f"{year}-{end}",
+                                "include_adult": False,
+                                "include_video": False,
+                                "page": page,
+                                "sort_by": "popularity.desc",
+                                "language": "en-US",
+                                "with_release_type": "3",
+                                # 可选收敛：
+                                # "region": "US",
+                                # "vote_count.gte": 50,
+                                # "with_runtime.gte": 60,
+                            }
+                            data = tmdb_get("https://api.themoviedb.org/3/discover/movie", params=params)
+                            total_pages = min(data.get("total_pages", 1), 500)
+                            if page == 1:
+                                logging.info("年份 %s 分片 %s-%s 总页数 ≈ %d", year, start, end, total_pages)
 
-                        main_country = derive_country(detail, countries)
-                        if not main_country:
-                            lang = (detail.get("original_language") or "unknown").lower()
-                            skip_country_counter[lang] = skip_country_counter.get(lang, 0) + 1
-                            skipped_country += 1
-                            continue
+                            for item in data.get("results", []):
+                                tmdb_id = item["id"]
+                                seen += 1
+                                if seen % LOG_EVERY == 0:
+                                    logging.info(
+                                        "年份 %s 分片 %s-%s 进度：页 %d/%d，已处理 %d 条（插入 %d，跳过国家 %d）",
+                                        year, start, end, page, total_pages, seen, inserted, skipped_country
+                                    )
 
-                        title = detail.get("title") or detail.get("original_title") or ""
-                        key = (norm_title(title), release_year, main_country)
-                        if key in movies_key:
-                            continue
+                                detail = tmdb_movie_detail_with_append(tmdb_id)
+                                release_year = year_or_none(detail.get("release_date"))
+                                if not release_year or release_year < START_YEAR or release_year > END_YEAR:
+                                    skipped_year += 1
+                                    continue
 
-                        runtime = detail.get("runtime")
-                        movieid = insert_movie(
-                            cur,
+                                main_country = derive_country(detail, countries)
+                                if not main_country:
+                                    lang = (detail.get("original_language") or "unknown").lower()
+                                    skip_country_counter[lang] = skip_country_counter.get(lang, 0) + 1
+                                    skipped_country += 1
+                                    continue
+
+                                title = detail.get("title") or detail.get("original_title") or ""
+                                key = (norm_title(title), release_year, main_country)
+                                if key in movies_key:
+                                    continue
+
+                                runtime = detail.get("runtime")
+                                movieid = insert_movie(
+                                    cur,
+                                    {
+                                        "title": title,
+                                        "country": main_country,
+                                        "year_released": release_year,
+                                        "runtime": runtime,
+                                    },
+                                )
+                                movies_key[key] = movieid
+                                inserted += 1
+                                new_movies += 1
+
+                                alt_titles_resp = (detail.get("alternative_titles") or {}).get("titles", [])
+                                alt_list = [t.get("title") for t in alt_titles_resp] + [title, detail.get("original_title")]
+                                upsert_alt_titles(cur, movieid, alt_list)
+
+                                credits = detail.get("credits") or {}
+                                credit_rows = []
+
+                                def get_person(pid: int):
+                                    if pid in person_cache:
+                                        return person_cache[pid]
+                                    p_detail = tmdb_person_detail(pid)
+                                    person_cache[pid] = p_detail
+                                    return p_detail
+
+                                # 演员
+                                for cast in credits.get("cast", [])[:ACTOR_LIMIT]:
+                                    pid = cast["id"]
+                                    full_name = cast.get("name") or cast.get("original_name") or ""
+                                    if not full_name.strip():
+                                        continue
+                                    gender = gender_map(cast.get("gender"))
+                                    fn, sn = split_name(full_name)
+                                    fn = trim(fn, 30)
+                                    sn = trim(sn, 30)
+                                    if not fn and not sn:
+                                        continue
+
+                                    p_detail = get_person(pid)
+                                    born = year_or_none(p_detail.get("birthday"))
+                                    died = year_or_none(p_detail.get("deathday"))
+
+                                    p_key = (fn or "", sn)
+                                    if p_key in people_key:
+                                        peopleid = people_key[p_key]
+                                    else:
+                                        peopleid = upsert_people(
+                                            cur,
+                                            {
+                                                "first_name": fn,
+                                                "surname": sn,
+                                                "born": born if born is not None else -1,
+                                                "died": died,
+                                                "gender": gender,
+                                            },
+                                        )
+                                        people_key[p_key] = peopleid
+                                        new_people += 1
+                                    credit_rows.append((movieid, peopleid, "A"))
+
+                                # 导演（优先 crew，若无则从 cast 回退）
+                                directors = [c for c in credits.get("crew", []) if c.get("job") == "Director"]
+                                if not directors:
+                                    directors = [
+                                        c
+                                        for c in credits.get("cast", [])
+                                        if c.get("job") == "Director" or c.get("known_for_department") == "Directing"
+                                    ]
+
+                                for crew in directors:
+                                    pid = crew["id"]
+                                    full_name = crew.get("name") or crew.get("original_name") or ""
+                                    if not full_name.strip():
+                                        continue
+                                    gender = gender_map(crew.get("gender"))
+                                    fn, sn = split_name(full_name)
+                                    fn = trim(fn, 30)
+                                    sn = trim(sn, 30)
+                                    if not fn and not sn:
+                                        continue
+
+                                    p_detail = get_person(pid)
+                                    born = year_or_none(p_detail.get("birthday"))
+                                    died = year_or_none(p_detail.get("deathday"))
+
+                                    p_key = (fn or "", sn)
+                                    if p_key in people_key:
+                                        peopleid = people_key[p_key]
+                                    else:
+                                        peopleid = upsert_people(
+                                            cur,
+                                            {
+                                                "first_name": fn,
+                                                "surname": sn,
+                                                "born": born if born is not None else -1,
+                                                "died": died,
+                                                "gender": gender,
+                                            },
+                                        )
+                                        people_key[p_key] = peopleid
+                                        new_people += 1
+                                    credit_rows.append((movieid, peopleid, "D"))
+
+                                upsert_credits(cur, credit_rows)
+                                new_credits += len(credit_rows)
+
+                            page += 1
+
+                        conn.commit()
+                        quarter_summaries.append(
                             {
-                                "title": title,
-                                "country": main_country,
-                                "year_released": release_year,
-                                "runtime": runtime,
-                            },
+                                "year": year,
+                                "start": start,
+                                "end": end,
+                                "processed": seen,
+                                "inserted_movies": inserted,
+                                "skipped_country": skipped_country,
+                                "skipped_year": skipped_year,
+                            }
                         )
-                        movies_key[key] = movieid
-                        inserted += 1
-                        new_movies += 1
+                        logging.info(
+                            "年份 %s 分片 %s-%s 提交：处理 %d，插入影片 %d，跳过国家 %d，跳过年份/无日期 %d",
+                            year, start, end, seen, inserted, skipped_country, skipped_year
+                        )
+                    except Exception:
+                        conn.rollback()
+                        logging.exception("年份 %s 分片 %s-%s 发生错误，已回滚该分片", year, start, end)
+                        raise
 
-                        # alt titles from appended response
-                        alt_titles_resp = (detail.get("alternative_titles") or {}).get("titles", [])
-                        alt_list = [t.get("title") for t in alt_titles_resp] + [title, detail.get("original_title")]
-                        upsert_alt_titles(cur, movieid, alt_list)
-
-                        credits = detail.get("credits") or {}
-                        credit_rows = []
-
-                        def get_person(pid: int):
-                            if pid in person_cache:
-                                return person_cache[pid]
-                            p_detail = tmdb_person_detail(pid)
-                            person_cache[pid] = p_detail
-                            return p_detail
-
-                        # 演员
-                        for cast in credits.get("cast", [])[:ACTOR_LIMIT]:
-                            pid = cast["id"]
-                            full_name = cast.get("name") or cast.get("original_name") or ""
-                            if not full_name.strip():
-                                continue  # 无姓名，跳过
-                            gender = gender_map(cast.get("gender"))
-                            fn, sn = split_name(full_name)
-                            fn = trim(fn, 30)
-                            sn = trim(sn, 30)
-                            if not fn and not sn:
-                                continue  # 分拆后仍无名姓，跳过
-
-                            p_detail = get_person(pid)
-                            born = year_or_none(p_detail.get("birthday"))
-                            died = year_or_none(p_detail.get("deathday"))
-
-                            p_key = (fn or "", sn)
-                            if p_key in people_key:
-                                peopleid = people_key[p_key]
-                            else:
-                                peopleid = upsert_people(
-                                    cur,
-                                    {
-                                        "first_name": fn,
-                                        "surname": sn,
-                                        "born": born if born is not None else -1,
-                                        "died": died,
-                                        "gender": gender,
-                                    },
-                                )
-                                people_key[p_key] = peopleid
-                                new_people += 1
-                            credit_rows.append((movieid, peopleid, "A"))
-
-                        # 导演（优先 crew，若 crew 无导演则从 cast 中尝试）
-                        directors = [c for c in credits.get("crew", []) if c.get("job") == "Director"]
-                        if not directors:
-                            directors = [
-                                c
-                                for c in credits.get("cast", [])
-                                if c.get("job") == "Director" or c.get("known_for_department") == "Directing"
-                            ]
-
-                        for crew in directors:
-                            pid = crew["id"]
-                            full_name = crew.get("name") or crew.get("original_name") or ""
-                            if not full_name.strip():
-                                continue  # 无姓名，跳过
-                            gender = gender_map(crew.get("gender"))
-                            fn, sn = split_name(full_name)
-                            fn = trim(fn, 30)
-                            sn = trim(sn, 30)
-                            if not fn and not sn:
-                                continue  # 分拆后仍无名姓，跳过
-
-                            p_detail = get_person(pid)
-                            born = year_or_none(p_detail.get("birthday"))
-                            died = year_or_none(p_detail.get("deathday"))
-
-                            p_key = (fn or "", sn)
-                            if p_key in people_key:
-                                peopleid = people_key[p_key]
-                            else:
-                                peopleid = upsert_people(
-                                    cur,
-                                    {
-                                        "first_name": fn,
-                                        "surname": sn,
-                                        "born": born if born is not None else -1,
-                                        "died": died,
-                                        "gender": gender,
-                                    },
-                                )
-                                people_key[p_key] = peopleid
-                                new_people += 1
-                            credit_rows.append((movieid, peopleid, "D"))
-
-                        upsert_credits(cur, credit_rows)
-                        new_credits += len(credit_rows)
-
-                logging.info(
-                    "年份 %s 完成：处理 %d，插入 %d，跳过国家 %d，跳过年份/无日期 %d",
-                    year, seen, inserted, skipped_country, skipped_year
-                )
-
-            conn.commit()
             logging.info("完成：新增影片 %d，新增人员 %d，新增关联 %d", new_movies, new_people, new_credits)
+            if quarter_summaries:
+                logging.info("已完成分片汇总：")
+                for q in quarter_summaries:
+                    logging.info(
+                        "  年 %s %s-%s: 处理 %d，插入影片 %d，跳过国家 %d，跳过年份/无日期 %d",
+                        q["year"], q["start"], q["end"], q["processed"], q["inserted_movies"], q["skipped_country"], q["skipped_year"]
+                    )
             if skip_country_counter:
                 logging.info("未匹配国家代码的语言/代码统计（请确保 countries 表有对应代码）：")
                 for lang, cnt in sorted(skip_country_counter.items(), key=lambda x: x[1], reverse=True):
                     logging.info("  %s -> %d", lang, cnt)
-    except Exception:
-        conn.rollback()
-        logging.exception("发生错误，已回滚")
+    except Exception as e:
+        logging.error("任务中止，原因：%s", e)
+        if quarter_summaries:
+            logging.info("已完成分片汇总（失败前）：")
+            for q in quarter_summaries:
+                logging.info(
+                    "  年 %s %s-%s: 处理 %d，插入影片 %d，跳过国家 %d，跳过年份/无日期 %d",
+                    q["year"], q["start"], q["end"], q["processed"], q["inserted_movies"], q["skipped_country"], q["skipped_year"]
+                )
         sys.exit(1)
     finally:
         conn.close()
